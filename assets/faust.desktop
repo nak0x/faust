@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Faust
+GenericName=Markdown Preview
+Comment=Live Markdown preview for Obsidian vaults
+Exec=faust %f
+Icon=faust
+Terminal=false
+Categories=Office;Viewer;TextTools;
+MimeType=text/markdown;text/x-markdown;inode/directory;
+Keywords=markdown;obsidian;vault;notes;preview;
+StartupNotify=true
+StartupWMClass=faust
