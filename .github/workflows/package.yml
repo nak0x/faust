@@ -22,6 +22,6 @@ jobs:
           command: release
           target: x86_64-unknown-linux-gnu
           archive: 'true'
-      - uses: softprops/action-gh-release@v2.6.1
+      - uses: softprops/action-gh-release@v3.0.3
         with:
           files: target/x86_64-unknown-linux-gnu/release/*.tar.gz
