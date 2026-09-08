@@ -11,6 +11,7 @@ use egui::{Key, Modifiers};
 use crate::config::{Config, TreeSide};
 use crate::document::Document;
 use crate::index::{FileEntry, Hit, Message, Search};
+use crate::layout::{Axis, Dir, PaneId, Panes};
 use crate::palette::{Command, Mode, Palette};
 use crate::theme::{self, Theme};
 use crate::tree::FileTree;
@@ -23,6 +24,14 @@ mod ui;
 const FS_DEBOUNCE: Duration = Duration::from_millis(60);
 /// Keystrokes in the content search are coalesced for this long.
 const QUERY_DEBOUNCE: Duration = Duration::from_millis(140);
+/// How long `ctrl+w` waits for the rest of its chord before giving up. Vim
+/// waits forever; a preview window that swallows the next key indefinitely
+/// would be a trap, so this matches a comfortable `timeoutlen`.
+const CHORD_TIMEOUT: Duration = Duration::from_millis(1200);
+/// `ctrl+h/j/k/l`, the vim motions, and where each one goes.
+const MOTION_KEYS: [Key; 4] = [Key::H, Key::J, Key::K, Key::L];
+const MOTIONS: [Dir; 4] = [Dir::Left, Dir::Down, Dir::Up, Dir::Right];
+
 /// `ctrl+1` .. `ctrl+9`, in tab order.
 const NUMBER_KEYS: [Key; 9] = [
     Key::Num1,
@@ -54,8 +63,7 @@ pub struct App {
     cfg: Config,
     theme: Theme,
     vault: Option<Vault>,
-    tabs: Vec<Document>,
-    active: usize,
+    panes: Panes,
     palette: Palette,
 
     search: Search,
@@ -80,8 +88,22 @@ pub struct App {
     saved: Config,
     dirty_since: Option<Instant>,
 
+    /// When `ctrl+w` was pressed and is waiting for the key that completes it.
+    chord: Option<Instant>,
+    /// The tab currently riding the cursor, if any.
+    drag: Option<TabDrag>,
+
     notice: Option<String>,
     quit: bool,
+}
+
+/// A tab in flight between (or within) tab strips.
+#[derive(Clone)]
+struct TabDrag {
+    pane: PaneId,
+    index: usize,
+    /// Kept here so the ghost under the cursor survives the tab being moved.
+    title: String,
 }
 
 impl App {
@@ -103,8 +125,7 @@ impl App {
             cfg,
             theme,
             vault: None,
-            tabs: Vec::new(),
-            active: 0,
+            panes: Panes::new(),
             palette: Palette::new(),
             search: Search::new(cc.egui_ctx.clone()),
             files: Vec::new(),
@@ -118,6 +139,8 @@ impl App {
             pending_query: None,
             content_query: String::new(),
             ranked: None,
+            chord: None,
+            drag: None,
             notice,
             quit: false,
         };
@@ -145,8 +168,7 @@ impl App {
 
     fn open_vault(&mut self, root: PathBuf, ctx: &egui::Context) {
         let root = root.canonicalize().unwrap_or(root);
-        self.tabs.clear();
-        self.active = 0;
+        self.panes = Panes::new();
         self.files.clear();
         self.hits.clear();
 
@@ -184,12 +206,15 @@ impl App {
             }
             return;
         }
-        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
-            self.active = index;
+        // Files always open in the focused pane, which is what makes the tree
+        // and the palette useful once the window is split.
+        let pane = self.panes.active_mut();
+        if let Some(index) = pane.tabs.iter().position(|tab| tab.path == path) {
+            pane.active = index;
             return;
         }
-        self.tabs.push(Document::open(path));
-        self.active = self.tabs.len() - 1;
+        pane.tabs.push(Document::open(path));
+        pane.active = pane.tabs.len() - 1;
     }
 
     /// Resolves an Obsidian `[[wikilink]]` against the index.
@@ -221,28 +246,24 @@ impl App {
     }
 
     fn active_path(&self) -> Option<&Path> {
-        self.tabs.get(self.active).map(|tab| tab.path.as_path())
+        self.panes.active().doc().map(|tab| tab.path.as_path())
     }
 
-    fn close_tab(&mut self, index: usize) {
-        if index >= self.tabs.len() {
-            return;
-        }
-        self.tabs.remove(index);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        }
+    fn close_tab(&mut self) {
+        let pane = self.panes.active_mut();
+        pane.take(pane.active);
     }
 
     fn cycle_tab(&mut self, forward: bool) {
-        if self.tabs.len() < 2 {
+        let pane = self.panes.active_mut();
+        let len = pane.tabs.len();
+        if len < 2 {
             return;
         }
-        let len = self.tabs.len();
-        self.active = if forward {
-            (self.active + 1) % len
+        pane.active = if forward {
+            (pane.active + 1) % len
         } else {
-            (self.active + len - 1) % len
+            (pane.active + len - 1) % len
         };
     }
 
@@ -268,34 +289,50 @@ impl App {
                 self.content_query.clear();
             }
             Command::ReloadFile => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
+                if let Some(tab) = self.panes.active_mut().doc_mut() {
                     tab.reload();
                 }
             }
             Command::RevealInTree => {
                 if let (Some(path), Some(vault)) = (
-                    self.tabs.get(self.active).map(|t| t.path.clone()),
+                    self.panes.active().doc().map(|tab| tab.path.clone()),
                     self.vault.as_mut(),
                 ) {
                     vault.tree.reveal(&path);
                     self.cfg.tree_visible = true;
                 }
             }
-            Command::CloseTab => self.close_tab(self.active),
+            Command::CloseTab => self.close_tab(),
             Command::CloseOthers => {
-                if self.active < self.tabs.len() {
-                    let keep = self.tabs.remove(self.active);
-                    self.tabs.clear();
-                    self.tabs.push(keep);
-                    self.active = 0;
+                let pane = self.panes.active_mut();
+                let at = pane.active;
+                if at < pane.tabs.len() {
+                    let keep = pane.tabs.remove(at);
+                    pane.tabs.clear();
+                    pane.tabs.push(keep);
+                    pane.active = 0;
                 }
             }
             Command::CloseAll => {
-                self.tabs.clear();
-                self.active = 0;
+                // Every pane, but the splits themselves stay: `Close Other
+                // Splits` is the command for undoing a layout.
+                for pane in self.panes.iter_mut() {
+                    pane.tabs.clear();
+                    pane.active = 0;
+                }
             }
             Command::NextTab => self.cycle_tab(true),
             Command::PrevTab => self.cycle_tab(false),
+            Command::SplitRight => {
+                self.panes.split(Axis::Row);
+            }
+            Command::SplitDown => {
+                self.panes.split(Axis::Column);
+            }
+            Command::NextPane => self.panes.cycle(true),
+            Command::ClosePane => self.panes.close(),
+            Command::OnlyPane => self.panes.only(),
+            Command::EqualizePanes => self.panes.equalize(),
             Command::ToggleTree => self.cfg.tree_visible = !self.cfg.tree_visible,
             Command::TreeLeft => self.dock(TreeSide::Left),
             Command::TreeRight => self.dock(TreeSide::Right),
@@ -351,6 +388,9 @@ impl App {
     // --------------------------------------------------------------- inputs
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.chord(ctx) {
+            return;
+        }
         let palette_open = self.palette.open;
         // Most specific first: `consume_key` ignores extra Shift and Alt.
         let hits = ctx.input_mut(|input| {
@@ -363,7 +403,8 @@ impl App {
                 content: input.consume_key(cmd_shift, Key::F),
                 next_tab: input.consume_key(cmd, Key::Tab),
                 find_file: input.consume_key(cmd, Key::P),
-                close_tab: input.consume_key(cmd, Key::W),
+                close_tab: input.consume_key(cmd_shift, Key::W),
+                window: input.consume_key(cmd, Key::W),
                 toggle_tree: input.consume_key(cmd, Key::B),
                 reload: input.consume_key(cmd, Key::R),
                 quit: input.consume_key(cmd, Key::Q),
@@ -371,6 +412,9 @@ impl App {
                 smaller: input.consume_key(cmd, Key::Minus),
                 escape: !palette_open && input.consume_key(Modifiers::NONE, Key::Escape),
                 tab_index: NUMBER_KEYS
+                    .iter()
+                    .position(|key| input.consume_key(cmd, *key)),
+                motion: MOTION_KEYS
                     .iter()
                     .position(|key| input.consume_key(cmd, *key)),
             }
@@ -396,7 +440,20 @@ impl App {
             self.cycle_tab(false);
         }
         if hits.close_tab {
-            self.close_tab(self.active);
+            self.close_tab();
+        }
+        if let Some(index) = hits.motion {
+            self.panes.focus_dir(MOTIONS[index]);
+        }
+        // The palette owns the keyboard while it is open, `ctrl+w` included.
+        if hits.window && !palette_open {
+            self.chord = Some(Instant::now());
+            // The rest of the chord may already be in this frame's events if
+            // it was typed as fast as a chord usually is.
+            if let Some((key, modifiers)) = ctx.input_mut(take_key) {
+                self.chord = None;
+                self.window_key(key, modifiers, ctx);
+            }
         }
         if hits.toggle_tree {
             self.cfg.tree_visible = !self.cfg.tree_visible;
@@ -416,8 +473,54 @@ impl App {
         if hits.escape {
             self.notice = None;
         }
-        if let Some(index) = hits.tab_index.filter(|index| *index < self.tabs.len()) {
-            self.active = index;
+        if let Some(index) = hits
+            .tab_index
+            .filter(|index| *index < self.panes.active().tabs.len())
+        {
+            self.panes.active_mut().active = index;
+        }
+    }
+
+    /// Waits out a `ctrl+w` chord, and returns whether it owns this frame.
+    ///
+    /// While the prefix is armed nothing else sees the keyboard: the next key
+    /// belongs to the chord, wherever it would otherwise have gone.
+    fn chord(&mut self, ctx: &egui::Context) -> bool {
+        let Some(since) = self.chord else {
+            return false;
+        };
+        let waited = since.elapsed();
+        if waited >= CHORD_TIMEOUT {
+            self.chord = None;
+            return false;
+        }
+        let Some((key, modifiers)) = ctx.input_mut(take_key) else {
+            ctx.request_repaint_after(CHORD_TIMEOUT - waited);
+            return true;
+        };
+        self.chord = None;
+        self.window_key(key, modifiers, ctx);
+        true
+    }
+
+    /// The second half of a `ctrl+w` chord, spelled as vim spells it.
+    ///
+    /// Anything else — `esc` included — just cancels, which is why there is no
+    /// fallback arm doing something surprising.
+    fn window_key(&mut self, key: Key, modifiers: Modifiers, ctx: &egui::Context) {
+        match key {
+            Key::V => self.run(Command::SplitRight, ctx),
+            Key::S => self.run(Command::SplitDown, ctx),
+            Key::H => self.panes.focus_dir(Dir::Left),
+            Key::J => self.panes.focus_dir(Dir::Down),
+            Key::K => self.panes.focus_dir(Dir::Up),
+            Key::L => self.panes.focus_dir(Dir::Right),
+            Key::W => self.panes.cycle(!modifiers.shift),
+            Key::C | Key::Q => self.run(Command::ClosePane, ctx),
+            Key::O => self.run(Command::OnlyPane, ctx),
+            Key::D => self.run(Command::CloseTab, ctx),
+            Key::Equals | Key::Plus => self.run(Command::EqualizePanes, ctx),
+            _ => {}
         }
     }
 
@@ -448,7 +551,7 @@ impl App {
 
         let mut structural = false;
         for path in &paths {
-            for tab in &mut self.tabs {
+            for tab in self.panes.docs_mut() {
                 if tab.path == *path {
                     tab.reload();
                 }
@@ -614,6 +717,8 @@ struct Shortcuts {
     next_tab: bool,
     prev_tab: bool,
     close_tab: bool,
+    /// The `ctrl+w` prefix, which arms a chord rather than doing anything.
+    window: bool,
     toggle_tree: bool,
     reload: bool,
     quit: bool,
@@ -621,6 +726,30 @@ struct Shortcuts {
     smaller: bool,
     escape: bool,
     tab_index: Option<usize>,
+    /// Index into [`MOTIONS`] of the `ctrl+h/j/k/l` that fired.
+    motion: Option<usize>,
+}
+
+/// Takes the first key press of the frame, and the text it produced with it.
+///
+/// A chord's second key must not also reach whatever it is normally bound to,
+/// and `consume_key` cannot help here because the key is not known in advance.
+fn take_key(input: &mut egui::InputState) -> Option<(Key, Modifiers)> {
+    let mut found = None;
+    input.events.retain(|event| match event {
+        egui::Event::Key {
+            key,
+            modifiers,
+            pressed: true,
+            ..
+        } if found.is_none() => {
+            found = Some((*key, *modifiers));
+            false
+        }
+        egui::Event::Text(_) => false,
+        _ => true,
+    });
+    found
 }
 
 fn name_of(path: &Path) -> String {

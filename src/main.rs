@@ -10,6 +10,7 @@ mod config;
 mod document;
 mod fuzzy;
 mod index;
+mod layout;
 mod markdown;
 mod palette;
 mod render;
@@ -40,9 +41,12 @@ KEYS:
     alt+space        command palette (everything lives here)
     ctrl+p           find a file or folder by name
     ctrl+shift+f     search inside notes
-    ctrl+w           close tab
+    ctrl+shift+w     close tab
     ctrl+tab         next tab            ctrl+shift+tab   previous tab
     ctrl+1..9        jump to tab
+    ctrl+w v         split right         ctrl+w s         split down
+    ctrl+w h/j/k/l   go to that split    ctrl+h/j/k/l     the same
+    ctrl+w c         close the split     ctrl+w o         close the others
     ctrl+b           toggle the file tree
     ctrl+r           reload the current file
     ctrl+= / ctrl+-  font size

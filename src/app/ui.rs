@@ -1,19 +1,23 @@
-//! Painting: window chrome, tab strip, tree, preview and the palette overlay.
+//! Painting: window chrome, panes and their tab strips, tree, preview and the
+//! palette overlay.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use egui::{vec2, Align, CornerRadius, Layout, Sense, Stroke, Ui};
+use egui::{pos2, vec2, Align, CornerRadius, Layout, Pos2, Rect, Sense, Stroke, Ui, UiBuilder};
 
-use super::{name_of, open_externally, App, RankKey, RESIZE_GRIP};
+use super::{name_of, open_externally, App, RankKey, TabDrag, RESIZE_GRIP};
 use crate::config::TreeSide;
 use crate::document::Status;
+use crate::layout::{Axis, Bar, Pane, PaneId, Slot, SPLIT_GAP};
 use crate::palette::{Command, Mode, Outcome};
 use crate::render::{Action, Renderer};
 use crate::theme::{self, Theme};
 
 /// Height of one file-tree row, relative to the font size.
 const ROW_SCALE: f32 = 1.6;
+/// Height of a pane's tab strip, relative to the font size.
+const STRIP_SCALE: f32 = 2.1;
 /// Widest comfortable measure for prose, in points.
 const READING_WIDTH: f32 = 900.0;
 
@@ -41,10 +45,9 @@ impl eframe::App for App {
         let screen = ctx.viewport_rect();
         self.cfg.window = [screen.width(), screen.height()];
 
-        self.tab_strip(ui, &theme);
         self.status_bar(ui, &theme);
         self.tree_panel(ui, &theme);
-        self.preview(ui, &theme);
+        self.pane_grid(ui, &theme);
         self.palette_overlay(&ctx, &theme);
 
         self.autosave(&ctx);
@@ -85,42 +88,42 @@ impl App {
         }
     }
 
-    fn resize_handles(&self, ui: &mut Ui, screen: egui::Rect) {
+    fn resize_handles(&self, ui: &mut Ui, screen: Rect) {
         use egui::ResizeDirection as Dir;
         let g = RESIZE_GRIP;
         let (x0, x1, y0, y1) = (screen.left(), screen.right(), screen.top(), screen.bottom());
         let zones = [
             (
                 Dir::NorthWest,
-                egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x0 + g, y0 + g)),
+                Rect::from_min_max(pos2(x0, y0), pos2(x0 + g, y0 + g)),
             ),
             (
                 Dir::NorthEast,
-                egui::Rect::from_min_max(egui::pos2(x1 - g, y0), egui::pos2(x1, y0 + g)),
+                Rect::from_min_max(pos2(x1 - g, y0), pos2(x1, y0 + g)),
             ),
             (
                 Dir::SouthWest,
-                egui::Rect::from_min_max(egui::pos2(x0, y1 - g), egui::pos2(x0 + g, y1)),
+                Rect::from_min_max(pos2(x0, y1 - g), pos2(x0 + g, y1)),
             ),
             (
                 Dir::SouthEast,
-                egui::Rect::from_min_max(egui::pos2(x1 - g, y1 - g), egui::pos2(x1, y1)),
+                Rect::from_min_max(pos2(x1 - g, y1 - g), pos2(x1, y1)),
             ),
             (
                 Dir::North,
-                egui::Rect::from_min_max(egui::pos2(x0 + g, y0), egui::pos2(x1 - g, y0 + g)),
+                Rect::from_min_max(pos2(x0 + g, y0), pos2(x1 - g, y0 + g)),
             ),
             (
                 Dir::South,
-                egui::Rect::from_min_max(egui::pos2(x0 + g, y1 - g), egui::pos2(x1 - g, y1)),
+                Rect::from_min_max(pos2(x0 + g, y1 - g), pos2(x1 - g, y1)),
             ),
             (
                 Dir::West,
-                egui::Rect::from_min_max(egui::pos2(x0, y0 + g), egui::pos2(x0 + g, y1 - g)),
+                Rect::from_min_max(pos2(x0, y0 + g), pos2(x0 + g, y1 - g)),
             ),
             (
                 Dir::East,
-                egui::Rect::from_min_max(egui::pos2(x1 - g, y0 + g), egui::pos2(x1, y1 - g)),
+                Rect::from_min_max(pos2(x1 - g, y0 + g), pos2(x1, y1 - g)),
             ),
         ];
 
@@ -136,97 +139,253 @@ impl App {
         }
     }
 
-    fn tab_strip(&mut self, ui: &mut Ui, theme: &Theme) {
-        let height = theme.font_size * 2.1;
-        egui::containers::Panel::top("faust-tabs")
-            .exact_size(height)
-            .frame(egui::Frame::new().inner_margin(egui::Margin {
-                left: 8,
-                right: 8,
-                top: 0,
-                bottom: 0,
-            }))
-            .show_separator_line(true)
+    // ----------------------------------------------------------------- panes
+
+    /// Lays the pane tree out over what the tree and the bars left behind.
+    fn pane_grid(&mut self, ui: &mut Ui, theme: &Theme) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new())
             .show(ui, |ui| {
-                // Claim the strip for window dragging first; the tabs drawn
-                // afterwards sit on top and keep their own clicks.
-                let bar = ui.interact(
-                    ui.max_rect(),
-                    egui::Id::new("faust-titlebar"),
-                    Sense::click_and_drag(),
-                );
-                if !self.cfg.decorations {
-                    if bar.drag_started() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
-                    if bar.double_clicked() {
-                        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
-                        ui.ctx()
-                            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                    }
+                let (slots, bars) = self.panes.layout(ui.max_rect());
+                for bar in &bars {
+                    self.splitter(ui, theme, bar);
                 }
 
-                if self.tabs.is_empty() {
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(self.window_title())
-                                .color(theme.text_faint)
-                                .font(theme.body()),
+                let mut strips = Vec::with_capacity(slots.len());
+                for slot in &slots {
+                    self.pane(ui, theme, *slot, &mut strips);
+                }
+
+                // The ring goes on last so that it sits over the pane's own
+                // content, and only when there is more than one pane to tell
+                // apart.
+                if slots.len() > 1 {
+                    if let Some(rect) = self.panes.rect(self.panes.focus()) {
+                        ui.painter().rect_stroke(
+                            rect.shrink(1.0),
+                            CornerRadius::same(4),
+                            Stroke::new(1.5, theme.focus),
+                            egui::StrokeKind::Inside,
                         );
-                    });
-                    return;
+                    }
                 }
+                self.tab_drag(ui, theme, &strips);
+            });
+    }
 
-                let mut activate = None;
-                let mut close = None;
+    /// The gap between two panes, which drags to change their ratio.
+    fn splitter(&mut self, ui: &mut Ui, theme: &Theme, bar: &Bar) {
+        let response = ui.interact(
+            bar.rect,
+            egui::Id::new(("faust-split", bar.index)),
+            Sense::drag(),
+        );
+        let live = response.hovered() || response.dragged();
+        if live {
+            ui.ctx().set_cursor_icon(match bar.axis {
+                Axis::Row => egui::CursorIcon::ResizeHorizontal,
+                Axis::Column => egui::CursorIcon::ResizeVertical,
+            });
+        }
+        if let Some(pos) = response
+            .interact_pointer_pos()
+            .filter(|_| response.dragged())
+        {
+            let parent = bar.parent;
+            let ratio = match bar.axis {
+                Axis::Row => {
+                    (pos.x - parent.left() - SPLIT_GAP / 2.0) / (parent.width() - SPLIT_GAP)
+                }
+                Axis::Column => {
+                    (pos.y - parent.top() - SPLIT_GAP / 2.0) / (parent.height() - SPLIT_GAP)
+                }
+            };
+            if ratio.is_finite() {
+                self.panes.set_ratio(bar.index, ratio);
+            }
+        }
+
+        let stroke = Stroke::new(1.0, if live { theme.focus } else { theme.separator });
+        let painter = ui.painter();
+        match bar.axis {
+            Axis::Row => painter.vline(bar.rect.center().x, bar.rect.y_range(), stroke),
+            Axis::Column => painter.hline(bar.rect.x_range(), bar.rect.center().y, stroke),
+        };
+    }
+
+    /// One pane: its tab strip, and whatever its current tab shows.
+    fn pane(&mut self, ui: &mut Ui, theme: &Theme, slot: Slot, strips: &mut Vec<Strip>) {
+        let strip = Rect::from_min_size(
+            slot.rect.min,
+            vec2(
+                slot.rect.width(),
+                (theme.font_size * STRIP_SCALE).min(slot.rect.height()),
+            ),
+        );
+        let body = Rect::from_min_max(pos2(slot.rect.left(), strip.bottom()), slot.rect.max);
+
+        // Any press inside the pane moves the focus to it. The pointer is read
+        // directly rather than through `interact` so that the scroll area, the
+        // tabs and the links inside the pane keep their own clicks and still
+        // cannot swallow the one thing every click also means.
+        if !self.palette.open {
+            let press = ui.input(|i| {
+                i.pointer
+                    .primary_pressed()
+                    .then(|| i.pointer.interact_pos())
+                    .flatten()
+            });
+            if press.is_some_and(|pos| slot.rect.contains(pos)) {
+                self.panes.set_focus(slot.id);
+            }
+        }
+
+        let tabs = self.pane_strip(ui, theme, slot.id, strip);
+        strips.push(Strip {
+            id: slot.id,
+            pane: slot.rect,
+            strip,
+            tabs,
+        });
+        self.pane_body(ui, theme, slot.id, body);
+    }
+
+    /// Paints a pane's tabs, returning where each one landed.
+    fn pane_strip(&mut self, ui: &mut Ui, theme: &Theme, id: PaneId, rect: Rect) -> Vec<Rect> {
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            theme.separator_stroke(),
+        );
+
+        // Empty strip space drags the window, as the title bar it stands in for.
+        let bar = ui.interact(
+            rect,
+            egui::Id::new(("faust-titlebar", id)),
+            Sense::click_and_drag(),
+        );
+        if !self.cfg.decorations {
+            if bar.drag_started() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if bar.double_clicked() {
+                let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+        }
+
+        let mut rects = Vec::new();
+        if self.panes.pane(id).is_none_or(|pane| pane.tabs.is_empty()) {
+            // A lone empty pane names the vault; in a split that would just be
+            // the same words several times over.
+            if self.panes.len() == 1 {
+                ui.painter().text(
+                    pos2(rect.left() + 10.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    self.window_title(),
+                    theme.body(),
+                    theme.text_faint,
+                );
+            }
+            return rects;
+        }
+
+        let mut activate = None;
+        let mut close = None;
+        let mut grab = None;
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(rect.shrink2(vec2(8.0, 0.0)))
+                .id_salt(("faust-strip", id))
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.set_clip_rect(rect.intersect(ui.clip_rect()));
                 egui::ScrollArea::horizontal()
-                    .id_salt("faust-tabstrip")
+                    .id_salt(("faust-tabstrip", id))
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
-                            for index in 0..self.tabs.len() {
-                                match self.tab(ui, theme, index) {
+                            let count = self.panes.pane(id).map_or(0, |pane| pane.tabs.len());
+                            for index in 0..count {
+                                let painted = self.tab(ui, theme, id, index);
+                                rects.push(painted.rect);
+                                match painted.hit {
                                     TabHit::None => {}
                                     TabHit::Activate => activate = Some(index),
                                     TabHit::Close => close = Some(index),
+                                    TabHit::Grab => grab = Some(index),
                                 }
                             }
                         });
                     });
+            },
+        );
 
-                if let Some(index) = activate {
-                    self.active = index;
-                }
-                if let Some(index) = close {
-                    self.close_tab(index);
-                }
-            });
+        if let Some(index) = activate {
+            self.panes.set_focus(id);
+            if let Some(pane) = self.panes.pane_mut(id) {
+                pane.active = index;
+            }
+        }
+        if let Some(index) = close {
+            self.panes.set_focus(id);
+            if let Some(pane) = self.panes.pane_mut(id) {
+                pane.take(index);
+            }
+        }
+        if let Some(index) = grab {
+            self.panes.set_focus(id);
+            let title = self
+                .panes
+                .pane(id)
+                .and_then(|pane| pane.tabs.get(index))
+                .map(|tab| tab.title.clone());
+            if let Some(title) = title {
+                self.drag = Some(TabDrag {
+                    pane: id,
+                    index,
+                    title,
+                });
+            }
+        }
+        rects
     }
 
-    fn tab(&self, ui: &mut Ui, theme: &Theme, index: usize) -> TabHit {
-        let Some(tab) = self.tabs.get(index) else {
-            return TabHit::None;
+    fn tab(&self, ui: &mut Ui, theme: &Theme, id: PaneId, index: usize) -> Painted {
+        let (Some(pane), focused) = (self.panes.pane(id), self.panes.focus() == id) else {
+            return Painted::nothing();
         };
-        let active = index == self.active;
+        let Some(tab) = pane.tabs.get(index) else {
+            return Painted::nothing();
+        };
+        let active = index == pane.active;
+        let lifted = matches!(&self.drag, Some(drag) if drag.pane == id && drag.index == index);
         let font = theme.body();
-        let text_color = if active { theme.text } else { theme.text_dim };
+        let text_color = match (active, focused) {
+            (true, true) => theme.text,
+            _ => theme.text_dim,
+        };
 
         let label = ui
             .painter()
             .layout_no_wrap(tab.title.clone(), font.clone(), text_color);
         let width = label.size().x + theme.font_size * 2.6;
         let (rect, response) =
-            ui.allocate_exact_size(vec2(width, ui.available_height()), Sense::click());
+            ui.allocate_exact_size(vec2(width, ui.available_height()), Sense::click_and_drag());
 
         let painter = ui.painter();
-        if active {
+        if lifted {
+            // The tab is riding the cursor; leave the gap it came from.
+            painter.rect_filled(rect, CornerRadius::ZERO, theme.hover);
+        } else if active {
             painter.rect_filled(rect, CornerRadius::ZERO, theme.surface_alt);
             painter.hline(
                 rect.x_range(),
                 rect.bottom() - 1.0,
-                Stroke::new(2.0, theme.accent),
+                Stroke::new(2.0, if focused { theme.accent } else { theme.marker }),
             );
         } else if response.hovered() {
             painter.rect_filled(rect, CornerRadius::ZERO, theme.hover);
@@ -236,23 +395,25 @@ impl App {
             rect.y_range().shrink(6.0),
             Stroke::new(1.0, theme.separator),
         );
-        painter.galley(
-            egui::pos2(rect.left() + 10.0, rect.center().y - label.size().y / 2.0),
-            label,
-            text_color,
-        );
+        if !lifted {
+            painter.galley(
+                pos2(rect.left() + 10.0, rect.center().y - label.size().y / 2.0),
+                label,
+                text_color,
+            );
+        }
 
         // The close affordance only appears where it can be hit.
-        let close_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.right() - theme.font_size * 0.85, rect.center().y),
+        let close_rect = Rect::from_center_size(
+            pos2(rect.right() - theme.font_size * 0.85, rect.center().y),
             vec2(theme.font_size, theme.font_size),
         );
         let close = ui.interact(
             close_rect,
-            egui::Id::new(("faust-tab-close", index)),
+            egui::Id::new(("faust-tab-close", id, index)),
             Sense::click(),
         );
-        if active || response.hovered() || close.hovered() {
+        if !lifted && (active || response.hovered() || close.hovered()) {
             ui.painter().text(
                 close_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -265,15 +426,132 @@ impl App {
                 },
             );
         }
+        if response.hovered() && self.drag.is_none() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
 
-        if close.clicked() || response.middle_clicked() {
+        let hit = if close.clicked() || response.middle_clicked() {
             TabHit::Close
+        } else if response.drag_started() {
+            TabHit::Grab
         } else if response.clicked() {
             TabHit::Activate
         } else {
             TabHit::None
+        };
+        Painted { rect, hit }
+    }
+
+    fn pane_body(&mut self, ui: &mut Ui, theme: &Theme, id: PaneId, rect: Rect) {
+        let mut actions = Vec::new();
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(rect.shrink2(vec2(16.0, 10.0)))
+                .id_salt(("faust-body", id)),
+            |ui| {
+                ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+                let Some(tab) = self.panes.pane(id).and_then(Pane::doc) else {
+                    self.empty_state(ui, theme);
+                    return;
+                };
+
+                egui::ScrollArea::vertical()
+                    .id_salt(("faust-preview", id, &tab.path))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let width = ui.available_width().min(READING_WIDTH);
+                        let margin = ((ui.available_width() - width) / 2.0).max(0.0);
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(margin);
+                            ui.vertical(|ui| {
+                                ui.set_width(width);
+                                match &tab.status {
+                                    Status::Ready => {
+                                        actions = Renderer::new(theme).show(ui, &tab.body);
+                                    }
+                                    status => {
+                                        ui.add_space(20.0);
+                                        ui.label(
+                                            egui::RichText::new(describe(status))
+                                                .color(theme.text_faint)
+                                                .font(theme.body()),
+                                        );
+                                    }
+                                }
+                                ui.add_space(40.0);
+                            });
+                        });
+                    });
+            },
+        );
+
+        for action in actions {
+            match action {
+                Action::OpenNote(name) => {
+                    self.panes.set_focus(id);
+                    self.open_note(&name);
+                }
+                Action::OpenUrl(url) => open_url(&url),
+            }
         }
     }
+
+    /// Carries a tab under the cursor and drops it where it is let go.
+    fn tab_drag(&mut self, ui: &mut Ui, theme: &Theme, strips: &[Strip]) {
+        let Some(drag) = self.drag.clone() else {
+            return;
+        };
+        let ctx = ui.ctx().clone();
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+
+        let pointer = ctx.pointer_latest_pos();
+        let target = pointer.and_then(|pos| {
+            strips
+                .iter()
+                .find(|strip| strip.pane.contains(pos))
+                .map(|strip| (strip.id, strip.drop_index(pos)))
+        });
+
+        if let Some(pos) = pointer {
+            if let Some((id, at)) = target {
+                if let Some(strip) = strips.iter().find(|strip| strip.id == id) {
+                    ui.painter().vline(
+                        strip.caret(at),
+                        strip.strip.y_range().shrink(4.0),
+                        Stroke::new(2.0, theme.focus),
+                    );
+                }
+            }
+            self.ghost(ui, theme, &drag.title, pos);
+        }
+
+        // A release anywhere ends the drag; a release over nothing puts the tab
+        // back where it came from.
+        if ctx.input(|i| i.pointer.any_released() || !i.pointer.any_down()) {
+            if let Some((to, at)) = target {
+                self.panes.move_tab(drag.pane, drag.index, to, at);
+            }
+            self.drag = None;
+        }
+    }
+
+    fn ghost(&self, ui: &mut Ui, theme: &Theme, title: &str, pos: Pos2) {
+        let galley = ui
+            .painter()
+            .layout_no_wrap(title.to_owned(), theme.body(), theme.text);
+        let rect = Rect::from_min_size(pos + vec2(12.0, 10.0), galley.size() + vec2(18.0, 10.0));
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(4), theme.surface_alt);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(4),
+            Stroke::new(1.0, theme.focus),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(rect.min + vec2(9.0, 5.0), galley, theme.text);
+    }
+
+    // ------------------------------------------------------------- the rest
 
     fn status_bar(&mut self, ui: &mut Ui, theme: &Theme) {
         let height = theme.font_size * 1.7;
@@ -317,9 +595,17 @@ impl App {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // A half-typed window chord is the one piece of modal
+                        // state Faust has; it says so rather than swallowing
+                        // the next key without explanation.
+                        let waiting = self.chord.is_some();
                         ui.label(
-                            egui::RichText::new("alt+space")
-                                .color(theme.text_faint)
+                            egui::RichText::new(if waiting { "^W" } else { "alt+space" })
+                                .color(if waiting {
+                                    theme.focus
+                                } else {
+                                    theme.text_faint
+                                })
                                 .font(small.clone()),
                         );
                         let count = if self.indexing {
@@ -440,7 +726,7 @@ impl App {
                         "\u{00b7}"
                     };
                     painter.text(
-                        egui::pos2(rect.left() + indent, rect.center().y),
+                        pos2(rect.left() + indent, rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         marker,
                         font.clone(),
@@ -454,7 +740,7 @@ impl App {
                         theme.text
                     };
                     painter.text(
-                        egui::pos2(rect.left() + indent + theme.font_size, rect.center().y),
+                        pos2(rect.left() + indent + theme.font_size, rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         &row.name,
                         font.clone(),
@@ -471,58 +757,6 @@ impl App {
                 }
             });
         hit
-    }
-
-    fn preview(&mut self, ui: &mut Ui, theme: &Theme) {
-        let frame = egui::Frame::new().inner_margin(egui::Margin {
-            left: 16,
-            right: 16,
-            top: 10,
-            bottom: 10,
-        });
-        let mut actions = Vec::new();
-
-        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            let Some(tab) = self.tabs.get(self.active) else {
-                self.empty_state(ui, theme);
-                return;
-            };
-
-            egui::ScrollArea::vertical()
-                .id_salt(("faust-preview", &tab.path))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let width = ui.available_width().min(READING_WIDTH);
-                    let margin = ((ui.available_width() - width) / 2.0).max(0.0);
-                    ui.horizontal_top(|ui| {
-                        ui.add_space(margin);
-                        ui.vertical(|ui| {
-                            ui.set_width(width);
-                            match &tab.status {
-                                Status::Ready => {
-                                    actions = Renderer::new(theme).show(ui, &tab.body);
-                                }
-                                status => {
-                                    ui.add_space(20.0);
-                                    ui.label(
-                                        egui::RichText::new(describe(status))
-                                            .color(theme.text_faint)
-                                            .font(theme.body()),
-                                    );
-                                }
-                            }
-                            ui.add_space(40.0);
-                        });
-                    });
-                });
-        });
-
-        for action in actions {
-            match action {
-                Action::OpenNote(name) => self.open_note(&name),
-                Action::OpenUrl(url) => open_url(&url),
-            }
-        }
     }
 
     fn empty_state(&self, ui: &mut Ui, theme: &Theme) {
@@ -637,10 +871,57 @@ impl App {
     }
 }
 
+/// Where a pane's tabs were painted this frame, so that a drop can be read
+/// back into an index once the pointer is let go.
+struct Strip {
+    id: PaneId,
+    pane: Rect,
+    strip: Rect,
+    tabs: Vec<Rect>,
+}
+
+impl Strip {
+    /// Which slot a drop at `pos` means: between the tabs it falls between, or
+    /// at the end when it lands on the pane rather than on the strip.
+    fn drop_index(&self, pos: Pos2) -> usize {
+        if !self.strip.contains(pos) {
+            return self.tabs.len();
+        }
+        self.tabs
+            .iter()
+            .filter(|rect| rect.center().x < pos.x)
+            .count()
+    }
+
+    /// Where to draw the insertion caret for `at`.
+    fn caret(&self, at: usize) -> f32 {
+        match (self.tabs.get(at), self.tabs.last()) {
+            (Some(rect), _) => rect.left(),
+            (None, Some(last)) => last.right(),
+            (None, None) => self.strip.left() + 8.0,
+        }
+    }
+}
+
+struct Painted {
+    rect: Rect,
+    hit: TabHit,
+}
+
+impl Painted {
+    const fn nothing() -> Self {
+        Self {
+            rect: Rect::NOTHING,
+            hit: TabHit::None,
+        }
+    }
+}
+
 enum TabHit {
     None,
     Activate,
     Close,
+    Grab,
 }
 
 enum TreeHit {

@@ -70,6 +70,9 @@ pub struct Theme {
     pub text_dim: Color32,
     pub text_faint: Color32,
     pub accent: Color32,
+    /// Ring around the pane that has the focus. Orange in both palettes, so
+    /// that it never reads as one more shade of the accent.
+    pub focus: Color32,
     pub selection: Color32,
     pub hover: Color32,
     pub code_bg: Color32,
@@ -93,6 +96,7 @@ impl Theme {
                 text_dim: Color32::from_rgb(0x5c, 0x5c, 0x5c),
                 text_faint: Color32::from_rgb(0x8c, 0x8c, 0x8c),
                 accent: Color32::from_rgb(0x2c, 0x6a, 0x9e),
+                focus: Color32::from_rgb(0xd4, 0x6b, 0x08),
                 selection: Color32::from_rgba_unmultiplied(0x2c, 0x6a, 0x9e, 0x33),
                 hover: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0x14),
                 code_bg: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0x12),
@@ -109,6 +113,7 @@ impl Theme {
                 text_dim: Color32::from_rgb(0xa0, 0xa0, 0xa0),
                 text_faint: Color32::from_rgb(0x6b, 0x6b, 0x6b),
                 accent: Color32::from_rgb(0x7f, 0xb0, 0xe6),
+                focus: Color32::from_rgb(0xfd, 0x97, 0x1f),
                 selection: Color32::from_rgba_unmultiplied(0x7f, 0xb0, 0xe6, 0x33),
                 hover: Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 0x14),
                 code_bg: Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 0x0e),

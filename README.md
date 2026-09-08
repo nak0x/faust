@@ -31,9 +31,11 @@ Everything else lives in the command palette; nothing is on a menu bar.
 | `alt+space` | command palette |
 | `ctrl+p` | find a file or folder by name |
 | `ctrl+shift+f` | search inside notes |
-| `ctrl+w` | close tab |
+| `ctrl+shift+w` | close tab |
 | `ctrl+tab` / `ctrl+shift+tab` | cycle tabs |
 | `ctrl+1`…`ctrl+9` | jump to tab |
+| `ctrl+w v` / `ctrl+w s` | split the view right / down |
+| `ctrl+h`/`j`/`k`/`l` | go to the split in that direction |
 | `ctrl+b` | toggle the file tree |
 | `ctrl+r` | reload the current file |
 | `ctrl+=` / `ctrl+-` | font size |
@@ -41,6 +43,35 @@ Everything else lives in the command palette; nothing is on a menu bar.
 
 In the palette: type to filter, `↑`/`↓` (or `ctrl+p`/`ctrl+n`) to move, `enter`
 to take the highlighted row — which is the first one until you move.
+
+## Splits
+
+`ctrl+w` is the window prefix, as in vim, and it takes the same keys:
+
+| key | |
+|---|---|
+| `v` / `s` | split right / down |
+| `h` `j` `k` `l` | go to the split in that direction |
+| `w` / `W` | go to the next / previous split |
+| `c` or `q` | close this split |
+| `o` | close every other split |
+| `d` | close this tab |
+| `=` | even out the splits |
+
+`ctrl+h`/`j`/`k`/`l` move between splits without the prefix, which is what
+[vim-tmux-navigator](https://github.com/christoomey/vim-tmux-navigator) trains
+your hands to press anyway.
+
+A split *moves* the current tab into the new pane rather than copying it, so a
+note is never open twice; the pane you split leaves shows the tab to the left of
+the one that left, or the empty state if there was none. Closing a split never
+closes what was open in it — its tabs go to the pane that takes over the space.
+The pane with the focus wears a thin orange ring, and everything you open lands
+in it.
+
+Tabs drag: within a strip to reorder them, onto another pane's strip to move
+them there, and onto a pane's body to send them to the end of it. Drag the bar
+between two panes to change how the space is divided.
 
 ## The file tree
 
